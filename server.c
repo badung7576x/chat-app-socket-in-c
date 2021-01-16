@@ -1,210 +1,213 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/select.h>
-#include <netinet/in.h>
-#include <string.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <crypt.h>
-#include "constant.h"
+#include "server.h"
 
-char outputBuffer[MAXLINE];
-char *publicStream;
+char buffer[MAXLINE];
 int uid = 0;
 int roomid = 0;
-int client_count = 0;
 int room_count = 0;
 
-typedef struct {
-    struct sockaddr_in addr;    
-    int connfd;                 
-    int uid;                    
-    char name[32];              
-    int currentRoomId;          
-} client_t;
-
-typedef struct {
-    int roomid;                 
-    char name[32];             
-    int userids[20];             
-    int actualUsers;            
-    int roomRemoved;            
-} room_t;
-
-client_t *clients[MAX_CLIENTS];
 room_t *rooms[MAX_ROOMS];
 
-pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t room_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+int main(int argc, char **argv) { createServer(); }
+
 int sendResponse(int connfd) {
-    if (strstr(outputBuffer, ACK) == NULL) {
-        strcat(outputBuffer, ACK);
-    }
-    return send(connfd, outputBuffer, strlen(outputBuffer), 0);
+    if (strstr(buffer, ACK) == NULL) strcat(buffer, ACK);
+    return send(connfd, buffer, strlen(buffer), 0);
 }
 
-char *splitMessage(char *message){
+char *splitMessage(char *message) {
     char *split = strchr(message, '#');
     *split = '\0';
     return split + 1;
 }
 
-int checkRoomName(char *roomName){
+void debug(char *funcName, char *str) {
+    printf("%s debug: %s \n", funcName, str);
+}
+
+void showRoom() {
     for (int i = 0; i < room_count; i++) {
-        if(!strcmp(roomName, rooms[i]->name) && rooms[i]->roomRemoved != 1){
-            return rooms[i]->roomid;
+        printf("%d. Room %s (%d)\n", i + 1, rooms[i]->name,
+               rooms[i]->userCount);
+        for (int j = 0; j < rooms[i]->userCount; j++) {
+            printf("\t%d. Client %s\n", j + 1, rooms[i]->clients[j]->name);
+        }
+        printf("Room chat: %s\n", rooms[i]->publicStream);
+    }
+}
+
+int checkRoomName(char *roomName) {
+    for (int i = 0; i < room_count; i++) {
+        if (!strcmp(roomName, rooms[i]->name)) {
+            return rooms[i]->roomId;
         }
     }
     return NOT_EXIST;
 }
 
-void messageToRoom(int roomId){
-    for(int i = 0; i < rooms[roomid]->actualUsers; i++){
-        if(clients[rooms[roomid]->userids[i]]->currentRoomId == roomid){
-            sendResponse(clients[rooms[roomid]->userids[i]]->connfd);
-        }
+int getRoomIndexByRoomId(int roomId) {
+    for (int i = 0; i < room_count; i++) {
+        if (rooms[i]->roomId == roomId) return i;
+    }
+    return NOT_EXIST;
+}
+
+void messageToRoom(int roomIndex) {
+    for (int i = 0; i < rooms[roomIndex]->userCount; i++) {
+        sendResponse(rooms[roomIndex]->clients[i]->connfd);
+    }
+}
+
+void messageToRoomExceptSender(client_t *client) {
+    int roomIndex = getRoomIndexByRoomId(client->currentRoomId);
+    if (roomIndex == NOT_EXIST) return;
+    for (int i = 0; i < rooms[roomIndex]->userCount; i++) {
+        if (rooms[roomIndex]->clients[i]->uid != client->uid)
+            sendResponse(rooms[roomIndex]->clients[i]->connfd);
     }
 }
 
 int checkUserInRoom(int roomId, char *name) {
-    for(int i = 0; i < rooms[roomid]->actualUsers; i++){
-        if(strcmp(clients[rooms[roomid]->userids[i]]->name, name) == 0){
-            return clients[rooms[roomid]->userids[i]]->connfd;
+    int roomIndex = getRoomIndexByRoomId(roomId);
+    if (roomIndex == NOT_EXIST) return;
+    for (int i = 0; i < rooms[roomIndex]->userCount; i++) {
+        if (strcmp(rooms[roomIndex]->clients[i]->name, name) == 0) {
+            return rooms[roomIndex]->clients[i]->connfd;
         }
     }
-    return -1;
+    return NOT_EXIST;
 }
 
-void getOnlineUsers(int roomId, char *list){
-    for(int i = 0; i < rooms[roomid]->actualUsers; i++){
-        if(clients[rooms[roomid]->userids[i]]->currentRoomId == roomid){
-            strcat(list, clients[rooms[roomid]->userids[i]]->name);
-            list[strlen(list)] = SEPARATOR;
-        }
+void getOnlineUsers(int roomIndex, char *list) {
+    for (int i = 0; i < rooms[roomIndex]->userCount; i++) {
+        strcat(list, rooms[roomIndex]->clients[i]->name);
+        list[strlen(list)] = SEPARATOR;
     }
 }
 
-void handleGetOnlineMember(int roomId, int sendTo) {
-    memset(outputBuffer, 0, MAXLINE);
-    outputBuffer[0] = GET_LIST_USER_ACTION;
-    getOnlineUsers(roomId, outputBuffer + 1);
-    sendResponse(sendTo);
+void handleGetOnlineMember(client_t *client) {
+    memset(buffer, 0, MAXLINE);
+    buffer[0] = GET_LIST_USER_ACTION;
+    getOnlineUsers(client->currentRoomId, buffer + 1);
+    sendResponse(client->connfd);
 }
 
-void updateOnlineUserToAll(int roomId) {
-    memset(outputBuffer, 0, MAXLINE);
-    outputBuffer[0] = GET_LIST_USER_ACTION;
-    getOnlineUsers(roomId, outputBuffer + 1);
-    messageToRoom(roomId);
+void updateOnlineUserToAll(int roomIndex) {
+    memset(buffer, 0, MAXLINE);
+    buffer[0] = GET_LIST_USER_ACTION;
+    getOnlineUsers(roomIndex, buffer + 1);
+    messageToRoom(roomIndex);
 }
 
 void handleUserExitRoom(client_t *client) {
     int roomId = client->currentRoomId;
+    int roomIndex = getRoomIndexByRoomId(roomId);
+    if (roomIndex == NOT_EXIST) return;
     char temp[200];
-    pthread_mutex_lock(&clients_mutex);
-    pthread_mutex_lock(&room_mutex);
+    removeUserToRoom(roomIndex, client);
+    memset(buffer, 0, MAXLINE);
+    sprintf(temp, ">>>> %s đã rời khỏi phòng chat! <<<<", client->name);
+    sprintf(buffer, "%c%s#%s", CHANNEL_MESSAGE_ACTION, "-", temp);
+    messageToRoom(roomIndex);
+    strcat(rooms[roomIndex]->publicStream, temp);
+    strcat(rooms[roomIndex]->publicStream, "\n");
 
-    rooms[client->currentRoomId]->actualUsers--;
-    if(rooms[client->currentRoomId]->actualUsers == 0){
-        rooms[client->currentRoomId]->roomRemoved = 1;
+    updateOnlineUserToAll(roomIndex);
+}
+
+void handleNewUserJoinMessage(client_t *client) {
+    char temp[200];
+    int roomIndex = getRoomIndexByRoomId(client->currentRoomId);
+    if (roomIndex == NOT_EXIST) return;
+    memset(buffer, 0, MAXLINE);
+    sprintf(temp, ">>>> %s đã tham gia phòng chat! <<<<", client->name);
+    sprintf(buffer, "%c%s#%s", CHANNEL_MESSAGE_ACTION, "-", temp);
+    messageToRoomExceptSender(client);
+    strcat(rooms[roomIndex]->publicStream, temp);
+    strcat(rooms[roomIndex]->publicStream, "\n");
+}
+
+void handleCreateRoom(client_t *client, char *message) {
+    if (DEBUG) {
+        char debugMess[200];
+        sprintf(debugMess, "Handler create room with ", message);
+        debug("handleCreateRoom", debugMess);
     }
-    client->currentRoomId =-1;  
-
-    pthread_mutex_unlock(&clients_mutex);
-    pthread_mutex_unlock(&room_mutex);
-    
-    memset(outputBuffer, 0, MAXLINE);
-    sprintf(temp, "%s đã rời khỏi phòng chat!", client->name);
-    sprintf(outputBuffer, "%c%s#%s", CHANNEL_MESSAGE_ACTION, ">>", temp);
-    messageToRoom(client);   
-    sprintf(temp, "%s:%s\n", ">>", temp);
-    strcat(publicStream, temp);
-
-    updateOnlineUserToAll(roomId);
-}
-
-void handleNewUserJoinMessage(client_t *client){
-    sleep(1);
-    char temp[200];
-    memset(outputBuffer, 0, MAXLINE);
-    sprintf(temp, "%s đã tham gia phòng chat!", client->name);
-    sprintf(outputBuffer, "%c%s#%s", CHANNEL_MESSAGE_ACTION, ">>", temp);
-    messageToRoom(client);   
-    sprintf(temp, "%s:%s\n", ">>", temp);
-    strcat(publicStream, temp);
-}
-
-void handleCreateRoom(client_t *client, char *message){
-    char *username = message;
+    char *username = message, temp[100];
     char *roomName = splitMessage(message);
-    if (checkRoomName(roomName) == NOT_EXIST) {
-        strcpy(client->name, username);
-        createRoom(client->uid, roomName);
-        sprintf(outputBuffer, "%c%s#%s", CREATE_ROOM_ACTION, SUCCESS, OK);
+    if (client->currentRoomId == -1) {
+        if (checkRoomName(roomName) == NOT_EXIST) {
+            strcpy(client->name, username);
+            createRoom(client, roomName);
+            sprintf(buffer, "%c%s#%s", CREATE_ROOM_ACTION, SUCCESS, OK);
+        } else {
+            sprintf(temp, ROOM_EXIST, roomName);
+            sprintf(buffer, "%c%s#%s", CREATE_ROOM_ACTION, FAILED, temp);
+        }
     } else {
-        sprintf(outputBuffer, "%c%s#%s", CREATE_ROOM_ACTION, FAILED, ROOM_EXIST);
+        sprintf(buffer, "%c%s#%s", CREATE_ROOM_ACTION, FAILED,
+                JOIN_ROOM_FAILED);
     }
     sendResponse(client->connfd);
 }
 
-int handleJoinRoom(client_t *client, char *message){
+int handleJoinRoom(client_t *client, char *message) {
     char *username = message;
     char *roomName = splitMessage(message);
-    if(client->currentRoomId == -1){
-        printf("CheckRoom\n");
+    if (client->currentRoomId == -1) {
         int roomId = checkRoomName(roomName);
-        if(roomId == -1) {
-            printf("Fail\n");
-            sprintf(outputBuffer, "%c%s#%s", JOIN_ROOM_ACTION, FAILED, JOIN_ROOM_FAILED);
+        if (roomId == NOT_EXIST) {
+            sprintf(buffer, "%c%s#%s", JOIN_ROOM_ACTION, FAILED,
+                    ROOM_NOT_EXIST);
             sendResponse(client->connfd);
             return 0;
         } else {
-            printf("Addroom\n");
-            addUserToRoom(roomId, client->uid);
-            updateRoomId(client, roomId);
             strcpy(client->name, username);
-            sprintf(outputBuffer, "%c%s#%s", JOIN_ROOM_ACTION, SUCCESS, OK);
+            addUserToRoom(roomId, client);
+            sprintf(buffer, "%c%s#%s", JOIN_ROOM_ACTION, SUCCESS, OK);
             sendResponse(client->connfd);
             return 1;
         }
+    } else {
+        sprintf(buffer, "%c%s#%s", JOIN_ROOM_ACTION, FAILED, JOIN_ROOM_FAILED);
+        sendResponse(client->connfd);
+        return 0;
     }
-    return 0;
 }
 
-
-void handlePublicMessage(client_t *client, char *message){
+void handlePublicMessage(client_t *client, char *message) {
     char temp[MAXLINE];
-    sprintf(temp, "%s:%s\n", client->name , message);
-    sprintf(outputBuffer, "%c%s#%s", CHANNEL_MESSAGE_ACTION, client->name, message);
-    messageToRoom(client);    
-    strcat(publicStream, temp);
+    int roomIndex = getRoomIndexByRoomId(client->currentRoomId);
+    if (roomIndex == NOT_EXIST) return;
+    sprintf(temp, "%s:%s\n", client->name, message);
+    sprintf(buffer, "%c%s#%s", CHANNEL_MESSAGE_ACTION, client->name, message);
+    messageToRoom(roomIndex);
+    strcat(rooms[roomIndex]->publicStream, temp);
 }
 
-void handleGetStream(int sendTo) {
-    sprintf(outputBuffer, "%c%s", GET_PUBLIC_STREAM, publicStream);
-    sendResponse(sendTo);
+void handleGetStream(client_t *client) {
+    int roomIndex = getRoomIndexByRoomId(client->currentRoomId);
+    if (roomIndex == NOT_EXIST) return;
+    sprintf(buffer, "%c%s", GET_PUBLIC_STREAM, rooms[roomIndex]->publicStream);
+    sendResponse(client->connfd);
 }
 
 void handlePrivateMessage(client_t *client, char *message) {
     char *sender = client->name;
     char *toUser = message;
     char *mess = splitMessage(message);
-    int userConnfd = checkUserInRoom(client, toUser);
-    
-    if (userConnfd != -1) {
-        sprintf(outputBuffer, "%c%s#%s", PRIVATE_MESSAGE_ACTION, sender, mess);
+    int userConnfd = checkUserInRoom(client->currentRoomId, toUser);
+
+    if (userConnfd != NOT_EXIST) {
+        sprintf(buffer, "%c%s#%s", PRIVATE_MESSAGE_ACTION, sender, mess);
         sendResponse(userConnfd);
     } else {
         printf("Error: No user:{%s}\n", toUser);
     }
 }
 
-int handleMessage(void *arg){
+int handleMessage(void *arg) {
     client_t *client = (client_t *)arg;
     int connfd = client->connfd, n;
     char action, *message;
@@ -216,23 +219,22 @@ int handleMessage(void *arg){
         printf("String received from client: %s\n", readBuffer);
         action = readBuffer[0];
         message = readBuffer + 1;
-        memset(outputBuffer, 0, MAXLINE);
-        switch(action) {
+        memset(buffer, 0, MAXLINE);
+        switch (action) {
             case CREATE_ROOM_ACTION:
                 handleCreateRoom(client, message);
                 break;
             case JOIN_ROOM_ACTION:
-                if(handleJoinRoom(client, message) == 1){
-                    memset(outputBuffer, 0, MAXLINE);
+                if (handleJoinRoom(client, message) == 1) {
                     updateOnlineUserToAll(client->currentRoomId);
                     handleNewUserJoinMessage(client);
                 }
                 break;
             case GET_PUBLIC_STREAM:
-                handleGetStream(client->connfd);
+                handleGetStream(client);
                 break;
             case GET_LIST_USER_ACTION:
-                handleGetOnlineMember(client->currentRoomId, client->connfd);
+                handleGetOnlineMember(client);
                 break;
             case CHANNEL_MESSAGE_ACTION:
                 handlePublicMessage(client, message);
@@ -247,7 +249,13 @@ int handleMessage(void *arg){
                 puts("\n--------------------UNKNOW ACTION-----------------");
                 printf("Send to socket:%d\n", connfd);
         }
+        showRoom();
     }
+    if (n == 0) {
+        printf("Client %d hung up\n", client->connfd);
+        handleUserExitRoom(client);
+    }
+    if (n < 0) perror("recv");
 }
 
 client_t *initNewClient(struct sockaddr_in clientAdd, int connfd) {
@@ -256,69 +264,79 @@ client_t *initNewClient(struct sockaddr_in clientAdd, int connfd) {
     client->connfd = connfd;
     client->uid = uid++;
     client->currentRoomId = -1;
-    addToClients(client);
     return client;
 }
 
-void addToClients(client_t *client){
-    pthread_mutex_lock(&clients_mutex);
-    for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (!clients[i]) {
-            clients[i] = client;
+void createRoom(client_t *client, char *roomName) {
+    if (DEBUG) {
+        char debugMess[200];
+        sprintf(debugMess, "Create Room by client socket: %d", client->connfd);
+        debug("createRoom", debugMess);
+    }
+
+    room_t *rm = (room_t *)malloc(sizeof(room_t));
+    strcpy(rm->name, roomName);
+    rm->userCount = 0;
+    rm->clients[rm->userCount++] = client;
+    rm->roomId = roomid++;
+    rm->publicStream = (char *)malloc(1024 * MAXLINE);
+
+    pthread_mutex_lock(&room_mutex);
+    rooms[room_count++] = rm;
+    pthread_mutex_unlock(&room_mutex);
+
+    updateRoomId(client, rm->roomId);
+}
+
+void addUserToRoom(int roomId, client_t *client) {
+    int roomIndex = getRoomIndexByRoomId(roomId);
+    if (roomIndex == NOT_EXIST) return;
+    int clientIndex = rooms[roomIndex]->userCount;
+
+    pthread_mutex_lock(&room_mutex);
+    rooms[roomIndex]->clients[clientIndex] = client;
+    rooms[roomIndex]->userCount++;
+    pthread_mutex_unlock(&room_mutex);
+
+    updateRoomId(client, roomId);
+}
+
+void removeUserToRoom(int roomIndex, client_t *client) {
+    pthread_mutex_lock(&room_mutex);
+    int deletePosition = -1;
+    for (int i = 0; i < rooms[roomIndex]->userCount; i++) {
+        if (rooms[roomIndex]->clients[i]->uid == client->uid) {
+            deletePosition = i;
             break;
         }
     }
-    pthread_mutex_unlock(&clients_mutex);
-}
+    if (deletePosition != -1) {
+        for (int i = deletePosition; i < rooms[roomIndex]->userCount - 1; i++) {
+            rooms[roomIndex]->clients[i] = rooms[roomIndex]->clients[i + 1];
+        }
+        rooms[roomIndex]->userCount--;
+    }
 
-
-void createRoom(int userId, char *roomName){
-    pthread_mutex_lock(&room_mutex);
-    room_t *rm = (room_t *)malloc(sizeof(room_t));
-    strcpy(rm->name, roomName);
-    rm->actualUsers = 0;
-    rm->actualUsers = 1;
-    rm->roomRemoved = 0;
-    rm->userids[rm->actualUsers++] = userId;
-    rm->roomid = room_count; 
-    rooms[room_count++] = rm;
-    clients[rm->userids[0]]->currentRoomId = rm->roomid;
-    pthread_mutex_unlock(&room_mutex);
-}
-
-void addUserToRoom(int roomId, int userId) {
-    pthread_mutex_lock(&room_mutex);
-    rooms[roomId]->userids[rooms[roomId]->actualUsers] =  userId;
-    rooms[roomId]->actualUsers++;
-    rooms[roomId]->actualUsers++;
+    if (rooms[roomIndex]->userCount <= 0) {
+        removeRoom(roomIndex);
+    }
+    updateRoomId(client, -1);
     pthread_mutex_unlock(&room_mutex);
 }
 
 void updateRoomId(client_t *client, int roomId) {
-    pthread_mutex_lock(&clients_mutex);
-    client->currentRoomId = roomId; 
-    pthread_mutex_unlock(&clients_mutex);
+    client->currentRoomId = roomId;
 }
 
-void removeToClients(int uid){
-	pthread_mutex_lock(&clients_mutex);
-
-	for(int i=0; i < MAX_CLIENTS; ++i){
-		if(clients[i]){
-			if(clients[i]->uid == uid){
-				clients[i] = NULL;
-				break;
-			}
-		}
-	}
-
-	pthread_mutex_unlock(&clients_mutex);
+void removeRoom(int roomIndex) {
+    for (int i = roomIndex; i < room_count - 1; i++) {
+        rooms[i] = rooms[i + 1];
+    }
+    room_count--;
 }
 
-
-int createServer(){
+int createServer() {
     int connfd, listenfd;
-    socklen_t clilen;
     pthread_t tid;
     struct sockaddr_in cliaddr, servaddr;
 
@@ -328,7 +346,7 @@ int createServer(){
     servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
     servaddr.sin_port = htons(SERV_PORT);
 
-    if (bind(listenfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) >= 0){
+    if (bind(listenfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) >= 0) {
         printf("Server is running at port %d\n", SERV_PORT);
     } else {
         perror("Bind failed");
@@ -340,19 +358,15 @@ int createServer(){
     printf("%s\n", "Server running...waiting for connections.");
 
     fflush(stdout);
-    while (1){
+    while (1) {
+        socklen_t clilen = sizeof(cliaddr);
         connfd = accept(listenfd, (struct sockaddr *)&cliaddr, &clilen);
-        if (connfd == -1){
+        if (connfd == -1) {
             perror("accept");
         } else {
             printf("New connection on socket %d\n", connfd);
-            client_t *client  = initNewClient(cliaddr, connfd);
-            pthread_create(&tid, NULL, &handleMessage, (void*)client);
+            client_t *client = initNewClient(cliaddr, connfd);
+            pthread_create(&tid, NULL, &handleMessage, (void *)client);
         }
     }
-}
-
-int main(int argc, char **argv) {
-    publicStream = (char *)malloc(1024 * MAXLINE);
-    createServer();
 }

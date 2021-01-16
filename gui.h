@@ -1,13 +1,14 @@
 #include <X11/Xlib.h>
 #include <gtk/gtk.h>
-#include "event.h"
 
+#include "event.h"
 
 void set_size(GtkWidget *gw, int width, int height);
 void set_position(GtkWidget *gw, int x, int y);
 void showMainWindow();
 void initMainWindow();
-void showMessage(GtkWidget *parent, GtkMessageType type, char *mms, char *content);
+void showMessage(GtkWidget *parent, GtkMessageType type, char *mms,
+                 char *content);
 void showCreateOrJoinDialog();
 void initCreateOrJoinDialog();
 GtkWidget *initMessageInput(int x, int y);

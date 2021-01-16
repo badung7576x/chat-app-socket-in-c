@@ -1,7 +1,7 @@
 #pragma once
 
-typedef struct User{
+typedef struct User {
     char username[32];
-    char * stream;
+    char* stream;
     int newMessage;
-}User;
+} User;
